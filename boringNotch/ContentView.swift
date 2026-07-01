@@ -13,6 +13,12 @@ import KeyboardShortcuts
 import SwiftUI
 import SwiftUIIntrospect
 
+private struct PassiveLyricLine: Identifiable, Equatable {
+    let id: String
+    let text: String
+    let isCurrent: Bool
+}
+
 @MainActor
 struct ContentView: View {
     @EnvironmentObject var vm: BoringViewModel
@@ -44,16 +50,41 @@ struct ContentView: View {
     private let extendedHoverPadding: CGFloat = 30
     private let zeroHeightHoverPadding: CGFloat = 10
 
+    private var usesExpandedNotchChrome: Bool {
+        vm.notchState == .open || shouldShowPassiveLyrics
+    }
+
+    private var notchHorizontalChromePadding: CGFloat {
+        guard usesExpandedNotchChrome else { return cornerRadiusInsets.closed.bottom }
+
+        return Defaults[.cornerRadiusScaling]
+            ? cornerRadiusInsets.opened.top
+            : cornerRadiusInsets.opened.bottom
+    }
+
+    private var notchOuterChromePadding: CGFloat {
+        usesExpandedNotchChrome ? 12 : 0
+    }
+
+    private var passiveLyricsContentWidth: CGFloat {
+        max(
+            360,
+            openNotchSize.width
+                - (notchHorizontalChromePadding * 2)
+                - (notchOuterChromePadding * 2)
+        )
+    }
+
     private var topCornerRadius: CGFloat {
-       ((vm.notchState == .open) && Defaults[.cornerRadiusScaling])
-                ? cornerRadiusInsets.opened.top
-                : cornerRadiusInsets.closed.top
+        (usesExpandedNotchChrome && Defaults[.cornerRadiusScaling])
+            ? cornerRadiusInsets.opened.top
+            : cornerRadiusInsets.closed.top
     }
 
     private var currentNotchShape: NotchShape {
         NotchShape(
             topCornerRadius: topCornerRadius,
-            bottomCornerRadius: ((vm.notchState == .open) && Defaults[.cornerRadiusScaling])
+            bottomCornerRadius: (usesExpandedNotchChrome && Defaults[.cornerRadiusScaling])
                 ? cornerRadiusInsets.opened.bottom
                 : cornerRadiusInsets.closed.bottom
         )
@@ -105,12 +136,9 @@ struct ContentView: View {
                     .frame(alignment: .top)
                     .padding(
                         .horizontal,
-                        vm.notchState == .open
-                        ? Defaults[.cornerRadiusScaling]
-                        ? (cornerRadiusInsets.opened.top) : (cornerRadiusInsets.opened.bottom)
-                        : cornerRadiusInsets.closed.bottom
+                        notchHorizontalChromePadding
                     )
-                    .padding([.horizontal, .bottom], vm.notchState == .open ? 12 : 0)
+                    .padding([.horizontal, .bottom], notchOuterChromePadding)
                     .background(.black)
                     .clipShape(currentNotchShape)
                     .overlay(alignment: .top) {
@@ -120,7 +148,7 @@ struct ContentView: View {
                             .padding(.horizontal, topCornerRadius)
                     }
                     .shadow(
-                        color: ((vm.notchState == .open || isHovering) && Defaults[.enableShadow])
+                        color: ((usesExpandedNotchChrome || isHovering) && Defaults[.enableShadow])
                             ? .black.opacity(0.7) : .clear, radius: Defaults[.cornerRadiusScaling] ? 6 : 4
                     )
                     .padding(
@@ -406,23 +434,43 @@ struct ContentView: View {
                 at: musicManager.estimatedPlaybackPosition(at: timeline.date),
                 surroundingLines: 1
             )
+            let lyricLines = lines.enumerated().map { index, line in
+                PassiveLyricLine(
+                    id: "\(index)-\(line.text)-\(line.isCurrent)",
+                    text: line.text,
+                    isCurrent: line.isCurrent
+                )
+            }
 
-            VStack(spacing: 7) {
-                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+            VStack(alignment: .center, spacing: 8) {
+                ForEach(lyricLines) { line in
                     Text(line.text)
-                        .font(line.isCurrent ? .system(size: 24, weight: .bold) : .system(size: 19, weight: .semibold))
+                        .font(
+                            line.isCurrent
+                                ? .system(size: 24, weight: .bold)
+                                : .system(size: 18, weight: .semibold)
+                        )
                         .foregroundStyle(line.isCurrent ? Color.white : Color.white.opacity(0.32))
+                        .multilineTextAlignment(.center)
                         .lineLimit(1)
                         .minimumScaleFactor(0.62)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentTransition(.opacity)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .scaleEffect(line.isCurrent ? 1 : 0.96)
+                        .blur(radius: line.isCurrent ? 0 : 0.35)
+                        .transition(
+                            .asymmetric(
+                                insertion: .move(edge: .bottom).combined(with: .opacity),
+                                removal: .move(edge: .top).combined(with: .opacity)
+                            )
+                        )
+                        .zIndex(line.isCurrent ? 1 : 0)
                 }
             }
             .padding(.horizontal, 24)
             .padding(.top, 16)
             .padding(.bottom, 18)
-            .frame(width: openNotchSize.width, height: 126, alignment: .center)
-            .animation(.smooth(duration: 0.24), value: lines.map { $0.text }.joined(separator: "\n"))
+            .frame(width: passiveLyricsContentWidth, height: 126, alignment: .center)
+            .animation(.spring(response: 0.42, dampingFraction: 0.86), value: lyricLines)
         }
     }
 
