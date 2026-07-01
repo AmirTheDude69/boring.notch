@@ -695,18 +695,37 @@ class MusicManager: ObservableObject {
     }
 
     func lyricLine(at elapsed: Double) -> String {
-        guard !syncedLyrics.isEmpty else {
-            guard !plainLyricsLines.isEmpty else { return currentLyrics }
-            guard songDuration > 0 else { return plainLyricsLines.first ?? currentLyrics }
-
-            let progress = min(max(elapsed / songDuration, 0), 0.999)
-            let index = min(Int(progress * Double(plainLyricsLines.count)), plainLyricsLines.count - 1)
-            return plainLyricsLines[index]
+        if !syncedLyrics.isEmpty {
+            return syncedLyrics[syncedLyricIndex(at: elapsed)].text
         }
-        // Binary search for last line with time <= elapsed
+
+        guard !plainLyricsLines.isEmpty else { return currentLyrics }
+        return plainLyricsLines[plainLyricIndex(at: elapsed)]
+    }
+
+    func lyricDisplayLines(at elapsed: Double, surroundingLines: Int = 1) -> [(text: String, isCurrent: Bool)] {
+        if !syncedLyrics.isEmpty {
+            let currentIndex = syncedLyricIndex(at: elapsed)
+            return visibleLyricLines(
+                syncedLyrics.map { $0.text },
+                currentIndex: currentIndex,
+                surroundingLines: surroundingLines
+            )
+        }
+
+        guard !plainLyricsLines.isEmpty else { return [] }
+        return visibleLyricLines(
+            plainLyricsLines,
+            currentIndex: plainLyricIndex(at: elapsed),
+            surroundingLines: surroundingLines
+        )
+    }
+
+    private func syncedLyricIndex(at elapsed: Double) -> Int {
         var low = 0
         var high = syncedLyrics.count - 1
         var idx = 0
+
         while low <= high {
             let mid = (low + high) / 2
             if syncedLyrics[mid].time <= elapsed {
@@ -716,7 +735,31 @@ class MusicManager: ObservableObject {
                 high = mid - 1
             }
         }
-        return syncedLyrics[idx].text
+
+        return idx
+    }
+
+    private func plainLyricIndex(at elapsed: Double) -> Int {
+        guard songDuration > 0 else { return 0 }
+
+        let progress = min(max(elapsed / songDuration, 0), 0.999)
+        return min(Int(progress * Double(plainLyricsLines.count)), plainLyricsLines.count - 1)
+    }
+
+    private func visibleLyricLines(
+        _ lines: [String],
+        currentIndex: Int,
+        surroundingLines: Int
+    ) -> [(text: String, isCurrent: Bool)] {
+        guard !lines.isEmpty else { return [] }
+
+        let safeCurrentIndex = min(max(currentIndex, 0), lines.count - 1)
+        let startIndex = max(0, safeCurrentIndex - surroundingLines)
+        let endIndex = min(lines.count - 1, safeCurrentIndex + surroundingLines)
+
+        return (startIndex...endIndex).map { index in
+            (text: lines[index], isCurrent: index == safeCurrentIndex)
+        }
     }
 
     private func triggerFlipAnimation() {

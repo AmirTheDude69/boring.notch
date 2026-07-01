@@ -36,6 +36,7 @@ struct ContentView: View {
     @Default(.useMusicVisualizer) var useMusicVisualizer
 
     @Default(.showNotHumanFace) var showNotHumanFace
+    @Default(.enableLyrics) private var enableLyrics
 
     // Shared interactive spring for movement/resizing to avoid conflicting animations
     private let animationSpring = Animation.interactiveSpring(response: 0.38, dampingFraction: 0.8, blendDuration: 0)
@@ -61,7 +62,9 @@ struct ContentView: View {
     private var computedChinWidth: CGFloat {
         var chinWidth: CGFloat = vm.closedNotchSize.width
 
-        if coordinator.expandingView.type == .battery && coordinator.expandingView.show
+        if shouldShowPassiveLyrics {
+            chinWidth = openNotchSize.width
+        } else if coordinator.expandingView.type == .battery && coordinator.expandingView.show
             && vm.notchState == .closed && Defaults[.showPowerStatusNotifications]
         {
             chinWidth = 640
@@ -78,6 +81,14 @@ struct ContentView: View {
         }
 
         return chinWidth
+    }
+
+    private var shouldShowPassiveLyrics: Bool {
+        enableLyrics
+            && vm.notchState == .closed
+            && !vm.hideOnClosed
+            && (musicManager.isPlaying || !musicManager.isPlayerIdle || musicManager.isFetchingLyrics)
+            && (!musicManager.syncedLyrics.isEmpty || !musicManager.plainLyricsLines.isEmpty || musicManager.isFetchingLyrics)
     }
 
     var body: some View {
@@ -287,6 +298,9 @@ struct ContentView: View {
                       } else if coordinator.sneakPeek.show && Defaults[.inlineHUD] && (coordinator.sneakPeek.type != .music) && (coordinator.sneakPeek.type != .battery) && vm.notchState == .closed {
                           InlineHUD(type: $coordinator.sneakPeek.type, value: $coordinator.sneakPeek.value, icon: $coordinator.sneakPeek.icon, hoverAnimation: $isHovering, gestureProgress: $gestureProgress)
                               .transition(.opacity)
+                      } else if shouldShowPassiveLyrics {
+                          PassiveLyricsLiveActivity()
+                              .transition(.opacity.combined(with: .move(edge: .top)))
                       } else if (!coordinator.expandingView.show || coordinator.expandingView.type == .music) && vm.notchState == .closed && (musicManager.isPlaying || !musicManager.isPlayerIdle) && coordinator.musicLiveActivityEnabled && !vm.hideOnClosed {
                           MusicLiveActivity()
                               .frame(alignment: .center)
@@ -383,6 +397,33 @@ struct ContentView: View {
             height: vm.effectiveClosedNotchHeight,
             alignment: .center
         )
+    }
+
+    @ViewBuilder
+    func PassiveLyricsLiveActivity() -> some View {
+        TimelineView(.animation(minimumInterval: 0.25)) { timeline in
+            let lines = musicManager.lyricDisplayLines(
+                at: musicManager.estimatedPlaybackPosition(at: timeline.date),
+                surroundingLines: 1
+            )
+
+            VStack(spacing: 7) {
+                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                    Text(line.text)
+                        .font(line.isCurrent ? .system(size: 24, weight: .bold) : .system(size: 19, weight: .semibold))
+                        .foregroundStyle(line.isCurrent ? Color.white : Color.white.opacity(0.32))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.62)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentTransition(.opacity)
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 16)
+            .padding(.bottom, 18)
+            .frame(width: openNotchSize.width, height: 126, alignment: .center)
+            .animation(.smooth(duration: 0.24), value: lines.map { $0.text }.joined(separator: "\n"))
+        }
     }
 
     @ViewBuilder

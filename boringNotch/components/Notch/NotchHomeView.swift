@@ -118,7 +118,6 @@ struct MusicControlsView: View {
     @State private var lastDragged: Date = .distantPast
     @Default(.musicControlSlots) private var slotConfig
     @Default(.musicControlSlotLimit) private var slotLimit
-    @Default(.enableLyrics) private var enableLyrics
 
     var body: some View {
         VStack(alignment: .leading) {
@@ -154,9 +153,6 @@ struct MusicControlsView: View {
                 frameWidth: width
             )
             .fontWeight(.medium)
-            if enableLyrics {
-                LyricsLineView(width: width)
-            }
         }
     }
 
