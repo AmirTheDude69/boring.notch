@@ -118,6 +118,7 @@ struct MusicControlsView: View {
     @State private var lastDragged: Date = .distantPast
     @Default(.musicControlSlots) private var slotConfig
     @Default(.musicControlSlotLimit) private var slotLimit
+    @Default(.enableLyrics) private var enableLyrics
 
     var body: some View {
         VStack(alignment: .leading) {
@@ -153,38 +154,8 @@ struct MusicControlsView: View {
                 frameWidth: width
             )
             .fontWeight(.medium)
-            if Defaults[.enableLyrics] {
-                TimelineView(.animation(minimumInterval: 0.25)) { timeline in
-                    let currentElapsed: Double = {
-                        guard musicManager.isPlaying else { return musicManager.elapsedTime }
-                        let delta = timeline.date.timeIntervalSince(musicManager.timestampDate)
-                        let progressed = musicManager.elapsedTime + (delta * musicManager.playbackRate)
-                        return min(max(progressed, 0), musicManager.songDuration)
-                    }()
-                    let line: String = {
-                        if musicManager.isFetchingLyrics { return "Loading lyrics…" }
-                        if !musicManager.syncedLyrics.isEmpty {
-                            return musicManager.lyricLine(at: currentElapsed)
-                        }
-                        let trimmed = musicManager.currentLyrics.trimmingCharacters(in: .whitespacesAndNewlines)
-                        return trimmed.isEmpty ? "No lyrics found" : trimmed.replacingOccurrences(of: "\n", with: " ")
-                    }()
-                    let isPersian = line.unicodeScalars.contains { scalar in
-                        let v = scalar.value
-                        return v >= 0x0600 && v <= 0x06FF
-                    }
-                    MarqueeText(
-                        .constant(line),
-                        font: .subheadline,
-                        nsFont: .subheadline,
-                        textColor: musicManager.isFetchingLyrics ? .gray.opacity(0.7) : .gray,
-                        frameWidth: width
-                    )
-                    .font(isPersian ? .custom("Vazirmatn-Regular", size: NSFont.preferredFont(forTextStyle: .subheadline).pointSize) : .subheadline)
-                    .lineLimit(1)
-                    .opacity(musicManager.isPlaying ? 1 : 0)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                }
+            if enableLyrics {
+                LyricsLineView(width: width)
             }
         }
     }
@@ -212,10 +183,19 @@ struct MusicControlsView: View {
 
     private var slotToolbar: some View {
         let slots = activeSlots
+        let nextIndex = slots.firstIndex(of: .next)
         return HStack(spacing: 6) {
             ForEach(Array(slots.enumerated()), id: \.offset) { index, slot in
                 slotView(for: slot)
                     .frame(alignment: .center)
+
+                if index == nextIndex {
+                    LyricsToggleButton()
+                }
+            }
+
+            if nextIndex == nil {
+                LyricsToggleButton()
             }
         }
         .frame(maxWidth: .infinity, alignment: .center)
@@ -315,6 +295,91 @@ struct FavoriteControlButton: View {
 
     private var iconColor: Color {
         musicManager.isFavoriteTrack ? .red : .primary
+    }
+}
+
+struct LyricsToggleButton: View {
+    @ObservedObject private var musicManager = MusicManager.shared
+    @Default(.enableLyrics) private var enableLyrics
+
+    var body: some View {
+        HoverButton(icon: "mic.fill", iconColor: iconColor, scale: .medium) {
+            MusicManager.shared.toggleLyricsDisplay()
+        }
+        .opacity(enableLyrics ? 1 : 0.38)
+        .help(enableLyrics ? "Hide lyrics" : "Show lyrics")
+    }
+
+    private var iconColor: Color {
+        guard enableLyrics else { return .primary }
+
+        if Defaults[.playerColorTinting] {
+            return Color(nsColor: musicManager.avgColor).ensureMinimumBrightness(factor: 0.78)
+        }
+
+        return .white
+    }
+}
+
+struct LyricsLineView: View {
+    @ObservedObject private var musicManager = MusicManager.shared
+    @Default(.enableLyrics) private var enableLyrics
+    let width: CGFloat
+
+    var body: some View {
+        if enableLyrics {
+            TimelineView(.animation(minimumInterval: 0.25)) { timeline in
+                let line = musicManager.lyricDisplayLine(
+                    at: musicManager.estimatedPlaybackPosition(at: timeline.date)
+                )
+
+                if let line {
+                    HStack(spacing: 5) {
+                        Image(systemName: musicManager.syncedLyrics.isEmpty ? "mic.fill" : "waveform")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(lyricColor)
+                            .frame(width: 14, height: 14)
+                            .contentTransition(.symbolEffect)
+
+                        MarqueeText(
+                            .constant(line),
+                            font: line.containsArabicScript
+                                ? .custom("Vazirmatn-Regular", size: NSFont.preferredFont(forTextStyle: .subheadline).pointSize)
+                                : .subheadline,
+                            nsFont: .subheadline,
+                            textColor: lyricColor,
+                            minDuration: 1.2,
+                            frameWidth: max(width - 22, 40)
+                        )
+                        .lineLimit(1)
+                    }
+                    .frame(width: width, height: 20, alignment: .leading)
+                    .opacity(musicManager.isPlaying || musicManager.isFetchingLyrics ? 1 : 0)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+            }
+        }
+    }
+
+    private var lyricColor: Color {
+        if musicManager.isFetchingLyrics {
+            return .gray.opacity(0.68)
+        }
+
+        if Defaults[.playerColorTinting] {
+            return Color(nsColor: musicManager.avgColor).ensureMinimumBrightness(factor: 0.68)
+        }
+
+        return .gray
+    }
+}
+
+private extension String {
+    var containsArabicScript: Bool {
+        unicodeScalars.contains { scalar in
+            let value = scalar.value
+            return value >= 0x0600 && value <= 0x06FF
+        }
     }
 }
 
