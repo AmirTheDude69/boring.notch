@@ -7,6 +7,23 @@
 
 import Foundation
 
+private final class MediaCheckerOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var text = ""
+
+    func append(_ chunk: String) {
+        lock.withLock {
+            text.append(chunk)
+        }
+    }
+
+    var containsSetupDone: Bool {
+        lock.withLock {
+            text.contains("setup_done")
+        }
+    }
+}
+
 final class MediaChecker: Sendable {
 
     enum MediaCheckerError: Error {
@@ -28,40 +45,47 @@ final class MediaChecker: Sendable {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
             process.arguments = [scriptURL.path, frameworkPath, nowPlayingTestClientPath, "test"]
 
+            let outputPipe = Pipe()
+            let outputBuffer = MediaCheckerOutputBuffer()
+
+            outputPipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+                outputBuffer.append(chunk)
+            }
+
+            process.standardOutput = outputPipe
+            process.standardError = outputPipe
+
             do {
                 try process.run()
             } catch {
                 throw MediaCheckerError.processExecutionFailed
             }
 
-            // Timeout after 10 seconds
-            let didExit: Bool = try await withThrowingTaskGroup(of: Bool.self) { group in
-                group.addTask {
-                    process.waitUntilExit()
-                    return true
-                }
-                group.addTask {
-                    try await Task.sleep(for: .seconds(10))
+            for _ in 0..<100 {
+                try await Task.sleep(for: .milliseconds(100))
+
+                if outputBuffer.containsSetupDone {
+                    outputPipe.fileHandleForReading.readabilityHandler = nil
                     if process.isRunning {
                         process.terminate()
                     }
-                    return false // Timed out
+                    return false
                 }
-                for try await exited in group {
-                    if exited {
-                        group.cancelAll()
-                        return true
-                    }
+
+                if !process.isRunning {
+                    outputPipe.fileHandleForReading.readabilityHandler = nil
+                    return process.terminationStatus == 1
                 }
-                throw MediaCheckerError.timeout
             }
 
-            if !didExit {
-                throw MediaCheckerError.timeout
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            if process.isRunning {
+                process.terminate()
             }
 
-            let isDeprecated = process.terminationStatus == 1
-            return isDeprecated
+            throw MediaCheckerError.timeout
         }.value
     }
 }

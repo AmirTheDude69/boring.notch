@@ -159,10 +159,14 @@ class MusicManager: ObservableObject {
         let preferredType = Defaults[.mediaController]
         print("Preferred Media Controller: \(preferredType)")
 
-        // If NowPlaying is deprecated but that's the preference, use Apple Music instead
-        let controllerType = (self.isNowPlayingDeprecated && preferredType == .nowPlaying)
-            ? .appleMusic
-            : preferredType
+        let controllerType: MediaControllerType
+        if Defaults[.enableLyrics], !self.isNowPlayingDeprecated {
+            controllerType = .nowPlaying
+        } else if self.isNowPlayingDeprecated && preferredType == .nowPlaying {
+            controllerType = .appleMusic
+        } else {
+            controllerType = preferredType
+        }
 
         if let controller = createController(for: controllerType) {
             setActiveController(controller)
@@ -357,6 +361,7 @@ class MusicManager: ObservableObject {
     func toggleLyricsDisplay() {
         let enabled = !Defaults[.enableLyrics]
         Defaults[.enableLyrics] = enabled
+        setActiveControllerBasedOnPreference()
 
         guard enabled else {
             clearLyrics()
