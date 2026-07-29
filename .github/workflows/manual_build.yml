@@ -17,17 +17,39 @@ on:
         required: false
         default: '16.4'
 
-# Least-privilege: workflow_dispatch build only; no token access needed beyond artifacts.
 permissions:
-  contents: write
+  contents: read
 
 
 jobs:
+  resolve_source:
+    name: Resolve immutable source commit
+    runs-on: ubuntu-latest
+    outputs:
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
+    steps:
+      - name: Resolve requested ref once
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REQUESTED_REF: ${{ github.event.inputs.head_ref || github.ref_name || 'main' }}
+        run: |
+          set -euo pipefail
+          ENCODED_REF=$(jq -rn --arg value "$REQUESTED_REF" '$value | @uri')
+          HEAD_SHA=$(gh api "repos/${REPO}/commits/${ENCODED_REF}" --jq '.sha')
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Requested ref did not resolve to a full commit SHA"
+            exit 1
+          fi
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build and sign app
+    needs: resolve_source
     uses: ./.github/workflows/build_reusable.yml
     with:
-      head_ref: ${{ github.event.inputs.head_ref || github.ref_name || 'main' }}
+      head_sha: ${{ needs.resolve_source.outputs.head_sha }}
       version: ${{ github.event.inputs.version || '' }}
       build_number: ${{ github.event.inputs.build_number || '' }}
       xcode_version: ${{ github.event.inputs.xcode_version || '16.4' }}

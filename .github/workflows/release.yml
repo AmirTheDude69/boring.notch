@@ -14,9 +14,7 @@ env:
   CODE_SIGN_IDENTITY: "Apple Development"
   XCODE_VERSION: "16.4"
 
-permissions:
-  contents: read
-  pull-requests: write
+permissions: {}
 
 jobs:
   # helper job to test for the release command in the comment; env is safe to use here
@@ -24,6 +22,9 @@ jobs:
     name: Check for release command
     if: ${{ github.event.issue.pull_request }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       is_release: ${{ steps.check.outputs.is_release }}
       is_eligible_pr: ${{ steps.check.outputs.is_eligible_pr }}
@@ -64,8 +65,9 @@ jobs:
     if: ${{ needs.check_release.outputs.is_release == 'true' && needs.check_release.outputs.is_eligible_pr == 'true' }}
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
+      issues: write
+      pull-requests: read
     outputs:
       is_beta: ${{ steps.extract_version.outputs.is_beta }}
       version: ${{ steps.extract_version.outputs.version }}
@@ -75,17 +77,20 @@ jobs:
       title: ${{ steps.release_notes.outputs.title }}
       release_notes: ${{ steps.release_notes.outputs.release_notes }}
       release_notes_github: ${{ steps.release_notes.outputs.release_notes_github }}
-      head_ref: ${{ steps.pr_info.outputs.head_ref }}
-      base_ref: ${{ steps.pr_info.outputs.base_ref }}
+      head_ref: ${{ steps.authorize.outputs.head_ref }}
+      head_sha: ${{ steps.authorize.outputs.head_sha }}
+      base_ref: ${{ steps.authorize.outputs.base_ref }}
+      base_sha: ${{ steps.authorize.outputs.base_sha }}
     steps:
-      - name: Validate permissions and PR state
+      - name: Authorize release and resolve immutable PR head
+        id: authorize
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          PR_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
-          REPO="${{ github.repository }}"
-          COMMENTER="${{ github.event.comment.user.login }}"
-          PR_NUMBER="${{ github.event.issue.number }}"
 
           # Acknowledge the command
           gh api "repos/${REPO}/issues/comments/${{ github.event.comment.id }}/reactions" \
@@ -98,37 +103,82 @@ jobs:
             exit 1
           fi
 
-          # Require mergeable, non-draft PR
-          IS_DRAFT=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.draft')
-          MERGEABLE=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.mergeable')
+          # Resolve and authorize the exact commit only after the admin gate.
+          PR_DATA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '{
+              state,
+              draft,
+              mergeable,
+              head_ref: .head.ref,
+              head_sha: .head.sha,
+              head_repo: .head.repo.full_name,
+              base_ref: .base.ref,
+              base_sha: .base.sha,
+              base_repo: .base.repo.full_name
+            }')
+          IS_DRAFT=$(jq -r '.draft' <<<"$PR_DATA")
+          MERGEABLE=$(jq -r '.mergeable' <<<"$PR_DATA")
+          STATE=$(jq -r '.state' <<<"$PR_DATA")
+          HEAD_REF=$(jq -r '.head_ref' <<<"$PR_DATA")
+          HEAD_SHA=$(jq -r '.head_sha' <<<"$PR_DATA")
+          HEAD_REPO=$(jq -r '.head_repo' <<<"$PR_DATA")
+          BASE_REF=$(jq -r '.base_ref' <<<"$PR_DATA")
+          BASE_SHA=$(jq -r '.base_sha' <<<"$PR_DATA")
+          BASE_REPO=$(jq -r '.base_repo' <<<"$PR_DATA")
+
+          if [[ "$HEAD_REPO" != "$REPO" || "$BASE_REPO" != "$REPO" ||
+                "$HEAD_REF" != "dev" || "$BASE_REF" != "main" ]]; then
+            echo "::error::PR #${PR_NUMBER} is not the expected same-repository dev-to-main PR"
+            exit 1
+          fi
+
+          if [[ "$STATE" != "open" ]]; then
+            echo "::error::PR #${PR_NUMBER} is not open"
+            exit 1
+          fi
+
           if [[ "$IS_DRAFT" == "true" || "$MERGEABLE" != "true" ]]; then
             echo "::error::PR #${PR_NUMBER} is not ready to merge (draft=${IS_DRAFT}, mergeable=${MERGEABLE})"
             exit 1
           fi
 
-      - name: Get PR branch info
-        id: pr_info
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          PR_DATA=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}" \
-            --jq '{head_ref: .head.ref, base_ref: .base.ref}')
-          echo "head_ref=$(echo "$PR_DATA" | jq -r '.head_ref')" >> "$GITHUB_OUTPUT"
-          echo "base_ref=$(echo "$PR_DATA" | jq -r '.base_ref')" >> "$GITHUB_OUTPUT"
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ||
+                ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::PR #${PR_NUMBER} returned an invalid head or base commit SHA"
+            exit 1
+          fi
+
+          RESOLVED_SHA=$(gh api "repos/${REPO}/commits/${HEAD_SHA}" --jq '.sha')
+          if [[ "$RESOLVED_SHA" != "$HEAD_SHA" ]]; then
+            echo "::error::PR head commit could not be resolved exactly"
+            exit 1
+          fi
+          RESOLVED_BASE_SHA=$(gh api "repos/${REPO}/commits/${BASE_SHA}" --jq '.sha')
+          if [[ "$RESOLVED_BASE_SHA" != "$BASE_SHA" ]]; then
+            echo "::error::PR base commit could not be resolved exactly"
+            exit 1
+          fi
+
+          {
+            echo "head_ref=$HEAD_REF"
+            echo "head_sha=$HEAD_SHA"
+            echo "base_ref=$BASE_REF"
+            echo "base_sha=$BASE_SHA"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ steps.pr_info.outputs.head_ref }}
+          ref: ${{ steps.authorize.outputs.head_sha }}
+          persist-credentials: false
 
       - name: Ensure scripts directory exists
         env:
-          BASE_REF: ${{ steps.pr_info.outputs.base_ref }}
+          BASE_SHA: ${{ steps.authorize.outputs.base_sha }}
         run: |
           if [ ! -f ".github/scripts/extract_version.py" ]; then
-            echo "Script not found in PR branch, fetching from base branch"
-            git fetch origin "$BASE_REF"
-            git checkout "origin/$BASE_REF" -- .github/scripts/
+            echo "Script not found in PR branch, fetching from the authorized base commit"
+            git fetch origin "$BASE_SHA"
+            git checkout "$BASE_SHA" -- .github/scripts/
           fi
 
       - name: Extract version from comment
@@ -148,6 +198,21 @@ jobs:
             echo "build_number=$BUILD_NUMBER"
           } >> "$GITHUB_OUTPUT"
           echo "Version: $VERSION | Beta: $IS_BETA | Build: $BUILD_NUMBER"
+
+      - name: Require stable releases to include the authorized base
+        if: steps.extract_version.outputs.is_beta == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.authorize.outputs.head_sha }}
+          BASE_SHA: ${{ steps.authorize.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          STATUS=$(gh api "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" --jq '.status')
+          if [[ "$STATUS" != "ahead" && "$STATUS" != "identical" ]]; then
+            echo "::error::The stable release PR must include the authorized main commit; sync main into dev through the normal reviewed PR path and retry"
+            exit 1
+          fi
 
       - name: Expose build configuration
         id: build_config
@@ -191,31 +256,74 @@ jobs:
             exit 1
           fi
 
-      - name: Sync branch (stable releases only)
-        if: steps.extract_version.outputs.is_beta == 'false'
+  verify_build_source:
+    name: Verify source before signing
+    needs: preparation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      head_sha: ${{ steps.verify.outputs.head_sha }}
+    steps:
+      - name: Verify authorized PR still owns the immutable commit
+        id: verify
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          BASE_REF: ${{ steps.pr_info.outputs.base_ref }}
-          HEAD_REF: ${{ steps.pr_info.outputs.head_ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          HEAD_REF: ${{ needs.preparation.outputs.head_ref }}
+          HEAD_SHA: ${{ needs.preparation.outputs.head_sha }}
+          BASE_REF: ${{ needs.preparation.outputs.base_ref }}
+          BASE_SHA: ${{ needs.preparation.outputs.base_sha }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global credential.https://github.com.helper \
-            "!f() { echo \"username=x-access-token\"; printf \"password=%s\\n\" \"\${GITHUB_TOKEN}\"; }; f"
-          git fetch origin "$BASE_REF"
-          git checkout "$HEAD_REF"
-          git merge --no-ff "origin/$BASE_REF" -m "Sync branch before release"
-          git push origin "$HEAD_REF"
+          PR_DATA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '{
+              state,
+              draft,
+              head_ref: .head.ref,
+              head_sha: .head.sha,
+              head_repo: .head.repo.full_name,
+              base_ref: .base.ref,
+              base_sha: .base.sha,
+              base_repo: .base.repo.full_name
+            }')
+
+          if ! jq -e \
+            --arg repo "$REPO" \
+            --arg head_ref "$HEAD_REF" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg base_ref "$BASE_REF" \
+            --arg base_sha "$BASE_SHA" \
+            '(.state == "open") and
+             (.draft == false) and
+             (.head_repo == $repo) and
+             (.base_repo == $repo) and
+             (.head_ref == $head_ref) and
+             (.head_sha == $head_sha) and
+             (.base_ref == $base_ref) and
+             (.base_sha == $base_sha)' \
+            <<<"$PR_DATA" >/dev/null; then
+            echo "::error::Authorized PR source changed before the signing build"
+            exit 1
+          fi
+
+          RESOLVED_SHA=$(gh api "repos/${REPO}/commits/${HEAD_SHA}" --jq '.sha')
+          [[ "$RESOLVED_SHA" == "$HEAD_SHA" ]] || {
+            echo "::error::Authorized commit no longer resolves exactly"
+            exit 1
+          }
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build and sign
-    needs: preparation
+    needs: [preparation, verify_build_source]
     permissions:
-      contents: write
+      contents: read
     uses: ./.github/workflows/build_reusable.yml
     with:
-      head_ref: ${{ needs.preparation.outputs.head_ref }}
+      head_sha: ${{ needs.verify_build_source.outputs.head_sha }}
       version: ${{ needs.preparation.outputs.version }}
       build_number: ${{ needs.preparation.outputs.build_number }}
       xcode_version: ${{ needs.preparation.outputs.xcode_version }}
@@ -225,20 +333,81 @@ jobs:
       P12_PASSWORD:              ${{ secrets.P12_PASSWORD }}
       KEYCHAIN_PASSWORD:         ${{ secrets.KEYCHAIN_PASSWORD }}
 
-  publish:
-    name: Publish release
+  verify_publish_source:
+    name: Verify source before appcast signing
     needs: [preparation, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      head_sha: ${{ steps.verify.outputs.head_sha }}
+    steps:
+      - name: Verify authorized PR still owns the immutable commit
+        id: verify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          HEAD_REF: ${{ needs.preparation.outputs.head_ref }}
+          HEAD_SHA: ${{ needs.preparation.outputs.head_sha }}
+          BASE_REF: ${{ needs.preparation.outputs.base_ref }}
+          BASE_SHA: ${{ needs.preparation.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          PR_DATA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '{
+              state,
+              draft,
+              head_ref: .head.ref,
+              head_sha: .head.sha,
+              head_repo: .head.repo.full_name,
+              base_ref: .base.ref,
+              base_sha: .base.sha,
+              base_repo: .base.repo.full_name
+            }')
+
+          if ! jq -e \
+            --arg repo "$REPO" \
+            --arg head_ref "$HEAD_REF" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg base_ref "$BASE_REF" \
+            --arg base_sha "$BASE_SHA" \
+            '(.state == "open") and
+             (.draft == false) and
+             (.head_repo == $repo) and
+             (.base_repo == $repo) and
+             (.head_ref == $head_ref) and
+             (.head_sha == $head_sha) and
+             (.base_ref == $base_ref) and
+             (.base_sha == $base_sha)' \
+            <<<"$PR_DATA" >/dev/null; then
+            echo "::error::Authorized PR source changed before appcast signing"
+            exit 1
+          fi
+
+          RESOLVED_SHA=$(gh api "repos/${REPO}/commits/${HEAD_SHA}" --jq '.sha')
+          [[ "$RESOLVED_SHA" == "$HEAD_SHA" ]] || {
+            echo "::error::Authorized commit no longer resolves exactly"
+            exit 1
+          }
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Prepare signed release metadata
+    needs: [preparation, build, verify_publish_source]
     runs-on: macos-latest
     permissions:
-      contents: write
+      contents: read
     env:
-      HEAD_REF: ${{ needs.preparation.outputs.head_ref }}
+      HEAD_SHA: ${{ needs.verify_publish_source.outputs.head_sha }}
       VERSION: ${{ needs.preparation.outputs.version }}
       IS_BETA: ${{ needs.preparation.outputs.is_beta }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ env.HEAD_REF }}
+          ref: ${{ env.HEAD_SHA }}
+          persist-credentials: false
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -355,45 +524,338 @@ jobs:
             -o updater/appcast.xml \
             Release/
 
-      - name: Commit appcast
+      - name: Upload signed appcast
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-appcast
+          path: updater/appcast.xml
+          if-no-files-found: error
+          retention-days: 1
+
+  update_release_metadata:
+    name: Commit generated release metadata
+    needs: [preparation, build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      release_head_sha: ${{ steps.commit_metadata.outputs.release_head_sha }}
+    steps:
+      - name: Download version metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-project-metadata
+          path: release-metadata/project
+
+      - name: Download signed appcast
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-appcast
+          path: release-metadata/appcast
+
+      - name: Commit metadata through the GitHub API
+        id: commit_metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          AUTHORIZED_HEAD_SHA: ${{ needs.preparation.outputs.head_sha }}
+          HEAD_REF: ${{ needs.preparation.outputs.head_ref }}
+          BASE_REF: ${{ needs.preparation.outputs.base_ref }}
+          BASE_SHA: ${{ needs.preparation.outputs.base_sha }}
+          IS_BETA: ${{ needs.preparation.outputs.is_beta }}
+          VERSION: ${{ needs.preparation.outputs.version }}
+          BUILD_NUMBER: ${{ needs.preparation.outputs.build_number }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [[ "${IS_BETA}" == "false" ]]; then
-            git add updater/appcast.xml
-            git commit -m "Update version to v${VERSION} and appcast" || true
-            git push origin "HEAD:${HEAD_REF}" || true
-          else
-            # Save generated appcast, switch to main, apply and push
-            cp updater/appcast.xml "$RUNNER_TEMP/appcast.xml"
-            git fetch origin main
-            git checkout main
-            cp "$RUNNER_TEMP/appcast.xml" updater/appcast.xml
-            git add updater/appcast.xml
-            git commit -m "Update appcast with beta release for v${VERSION}" || true
-            git push origin main
+          PROJECT_FILE="release-metadata/project/project.pbxproj"
+          APPCAST_FILE="release-metadata/appcast/appcast.xml"
+          [[ -s "$PROJECT_FILE" && -s "$APPCAST_FILE" ]] || {
+            echo "::error::Generated release metadata is missing"
+            exit 1
+          }
+
+          PR_DATA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '{
+              state,
+              draft,
+              head_ref: .head.ref,
+              head_sha: .head.sha,
+              head_repo: .head.repo.full_name,
+              base_ref: .base.ref,
+              base_sha: .base.sha,
+              base_repo: .base.repo.full_name
+            }')
+          if ! jq -e \
+            --arg repo "$REPO" \
+            --arg head_ref "$HEAD_REF" \
+            --arg head_sha "$AUTHORIZED_HEAD_SHA" \
+            --arg base_ref "$BASE_REF" \
+            --arg base_sha "$BASE_SHA" \
+            '(.state == "open") and
+             (.draft == false) and
+             (.head_repo == $repo) and
+             (.base_repo == $repo) and
+             (.head_ref == $head_ref) and
+             (.head_sha == $head_sha) and
+             (.base_ref == $base_ref) and
+             (.base_sha == $base_sha)' \
+            <<<"$PR_DATA" >/dev/null; then
+            echo "::error::PR source changed before release metadata could be committed"
+            exit 1
           fi
 
-      - name: Create GitHub release
+          create_blob() {
+            local source_file="$1"
+            local request_file="$RUNNER_TEMP/blob-request.json"
+            local encoded
+            encoded=$(base64 <"$source_file" | tr -d '\n')
+            jq -n --arg content "$encoded" \
+              '{content: $content, encoding: "base64"}' >"$request_file"
+            gh api -X POST "repos/${REPO}/git/blobs" \
+              --input "$request_file" --jq '.sha'
+          }
+
+          create_commit() {
+            local parent_sha="$1"
+            local base_tree_sha="$2"
+            local tree_entries_file="$3"
+            local message="$4"
+            local tree_request="$RUNNER_TEMP/tree-request.json"
+            local commit_request="$RUNNER_TEMP/commit-request.json"
+            local tree_sha
+
+            jq -n \
+              --arg base_tree "$base_tree_sha" \
+              --slurpfile entries "$tree_entries_file" \
+              '{base_tree: $base_tree, tree: $entries[0]}' >"$tree_request"
+            tree_sha=$(gh api -X POST "repos/${REPO}/git/trees" \
+              --input "$tree_request" --jq '.sha')
+            jq -n \
+              --arg message "$message" \
+              --arg tree "$tree_sha" \
+              --arg parent "$parent_sha" \
+              '{message: $message, tree: $tree, parents: [$parent]}' >"$commit_request"
+            gh api -X POST "repos/${REPO}/git/commits" \
+              --input "$commit_request" --jq '.sha'
+          }
+
+          update_ref() {
+            local ref_name="$1"
+            local expected_sha="$2"
+            local new_sha="$3"
+            local current_sha
+            local request_file="$RUNNER_TEMP/ref-request.json"
+
+            current_sha=$(gh api "repos/${REPO}/git/ref/heads/${ref_name}" --jq '.object.sha')
+            if [[ "$current_sha" != "$expected_sha" ]]; then
+              echo "::error::Ref ${ref_name} moved before its controlled update"
+              return 1
+            fi
+            jq -n --arg sha "$new_sha" '{sha: $sha, force: false}' >"$request_file"
+            gh api -X PATCH "repos/${REPO}/git/refs/heads/${ref_name}" \
+              --input "$request_file" --silent
+          }
+
+          PROJECT_BLOB=$(create_blob "$PROJECT_FILE")
+          APPCAST_BLOB=$(create_blob "$APPCAST_FILE")
+          AUTHORIZED_TREE=$(gh api "repos/${REPO}/git/commits/${AUTHORIZED_HEAD_SHA}" --jq '.tree.sha')
+
+          if [[ "$IS_BETA" == "false" ]]; then
+            jq -n \
+              --arg project_blob "$PROJECT_BLOB" \
+              --arg appcast_blob "$APPCAST_BLOB" \
+              '[
+                {
+                  path: "boringNotch.xcodeproj/project.pbxproj",
+                  mode: "100644",
+                  type: "blob",
+                  sha: $project_blob
+                },
+                {
+                  path: "updater/appcast.xml",
+                  mode: "100644",
+                  type: "blob",
+                  sha: $appcast_blob
+                }
+              ]' >"$RUNNER_TEMP/dev-tree-entries.json"
+            RELEASE_HEAD_SHA=$(create_commit \
+              "$AUTHORIZED_HEAD_SHA" \
+              "$AUTHORIZED_TREE" \
+              "$RUNNER_TEMP/dev-tree-entries.json" \
+              "Update version to v${VERSION} and appcast")
+            update_ref "$HEAD_REF" "$AUTHORIZED_HEAD_SHA" "$RELEASE_HEAD_SHA"
+          else
+            jq -n \
+              --arg project_blob "$PROJECT_BLOB" \
+              '[
+                {
+                  path: "boringNotch.xcodeproj/project.pbxproj",
+                  mode: "100644",
+                  type: "blob",
+                  sha: $project_blob
+                }
+              ]' >"$RUNNER_TEMP/dev-tree-entries.json"
+            RELEASE_HEAD_SHA=$(create_commit \
+              "$AUTHORIZED_HEAD_SHA" \
+              "$AUTHORIZED_TREE" \
+              "$RUNNER_TEMP/dev-tree-entries.json" \
+              "Set version to v${VERSION} (build ${BUILD_NUMBER})")
+            update_ref "$HEAD_REF" "$AUTHORIZED_HEAD_SHA" "$RELEASE_HEAD_SHA"
+
+            BASE_SHA=$(gh api "repos/${REPO}/git/ref/heads/${BASE_REF}" --jq '.object.sha')
+            BASE_TREE=$(gh api "repos/${REPO}/git/commits/${BASE_SHA}" --jq '.tree.sha')
+            jq -n \
+              --arg appcast_blob "$APPCAST_BLOB" \
+              '[
+                {
+                  path: "updater/appcast.xml",
+                  mode: "100644",
+                  type: "blob",
+                  sha: $appcast_blob
+                }
+              ]' >"$RUNNER_TEMP/base-tree-entries.json"
+            APPCAST_COMMIT_SHA=$(create_commit \
+              "$BASE_SHA" \
+              "$BASE_TREE" \
+              "$RUNNER_TEMP/base-tree-entries.json" \
+              "Update appcast with beta release for v${VERSION}")
+            update_ref "$BASE_REF" "$BASE_SHA" "$APPCAST_COMMIT_SHA"
+          fi
+
+          UPDATED_PR_HEAD=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')
+          if [[ "$UPDATED_PR_HEAD" != "$RELEASE_HEAD_SHA" ]]; then
+            echo "::error::PR head does not match the controlled metadata commit"
+            exit 1
+          fi
+          echo "release_head_sha=$RELEASE_HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+  merge_stable_pr:
+    name: Merge authorized stable release PR
+    needs: [preparation, update_release_metadata]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Keep beta PR open
+        if: needs.preparation.outputs.is_beta == 'true'
+        run: echo "Beta release leaves the dev-to-main PR open"
+
+      - name: Merge the exact release PR head
+        if: needs.preparation.outputs.is_beta == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          AUTHORIZED_HEAD_SHA: ${{ needs.preparation.outputs.head_sha }}
+          RELEASE_HEAD_SHA: ${{ needs.update_release_metadata.outputs.release_head_sha }}
+          HEAD_REF: ${{ needs.preparation.outputs.head_ref }}
+          BASE_REF: ${{ needs.preparation.outputs.base_ref }}
+          BASE_SHA: ${{ needs.preparation.outputs.base_sha }}
+          VERSION: ${{ needs.preparation.outputs.version }}
+        run: |
+          set -euo pipefail
+          PR_DATA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '{
+              state,
+              draft,
+              head_ref: .head.ref,
+              head_sha: .head.sha,
+              head_repo: .head.repo.full_name,
+              base_ref: .base.ref,
+              base_sha: .base.sha,
+              base_repo: .base.repo.full_name
+            }')
+          if ! jq -e \
+            --arg repo "$REPO" \
+            --arg head_ref "$HEAD_REF" \
+            --arg head_sha "$RELEASE_HEAD_SHA" \
+            --arg base_ref "$BASE_REF" \
+            --arg base_sha "$BASE_SHA" \
+            '(.state == "open") and
+             (.draft == false) and
+             (.head_repo == $repo) and
+             (.base_repo == $repo) and
+             (.head_ref == $head_ref) and
+             (.head_sha == $head_sha) and
+             (.base_ref == $base_ref) and
+             (.base_sha == $base_sha)' \
+            <<<"$PR_DATA" >/dev/null; then
+            echo "::error::PR source or base changed before the final merge"
+            exit 1
+          fi
+
+          COMMIT_DATA=$(gh api "repos/${REPO}/git/commits/${RELEASE_HEAD_SHA}" \
+            --jq '{parents: [.parents[].sha]}')
+          if ! jq -e \
+            --arg authorized "$AUTHORIZED_HEAD_SHA" \
+            '(.parents | length) == 1 and .parents[0] == $authorized' \
+            <<<"$COMMIT_DATA" >/dev/null; then
+            echo "::error::Release metadata commit is not a direct child of the authorized PR head"
+            exit 1
+          fi
+
+          UNEXPECTED_FILES=$(gh api \
+            "repos/${REPO}/compare/${AUTHORIZED_HEAD_SHA}...${RELEASE_HEAD_SHA}" \
+            --jq '.files[]?.filename' |
+            grep -Ev '^(boringNotch\.xcodeproj/project\.pbxproj|updater/appcast\.xml)$' || true)
+          if [[ -n "$UNEXPECTED_FILES" ]]; then
+            echo "::error::Release metadata commit contains unexpected files"
+            exit 1
+          fi
+
+          jq -n \
+            --arg sha "$RELEASE_HEAD_SHA" \
+            --arg title "Release version v${VERSION}" \
+            '{sha: $sha, merge_method: "merge", commit_title: $title}' \
+            >"$RUNNER_TEMP/merge-request.json"
+          MERGE_RESULT=$(gh api -X PUT "repos/${REPO}/pulls/${PR_NUMBER}/merge" \
+            --input "$RUNNER_TEMP/merge-request.json")
+          if ! jq -e '.merged == true' <<<"$MERGE_RESULT" >/dev/null; then
+            MERGE_MESSAGE=$(jq -r '.message // "GitHub declined the merge"' <<<"$MERGE_RESULT")
+            echo "::error::${MERGE_MESSAGE}"
+            exit 1
+          fi
+
+  create_release:
+    name: Create GitHub release
+    needs: [preparation, publish, update_release_metadata, merge_stable_pr]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.preparation.outputs.version }}
+      IS_BETA: ${{ needs.preparation.outputs.is_beta }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.PROJECT_NAME }}.dmg
+          path: Release
+
+      - name: Create GitHub release at the controlled commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TITLE: ${{ needs.preparation.outputs.title }}
           NOTES: ${{ needs.preparation.outputs.release_notes_github }}
+          TARGET_SHA: ${{ needs.update_release_metadata.outputs.release_head_sha }}
         run: |
+          set -euo pipefail
           RELEASE_FLAGS=()
           if [[ "${IS_BETA}" == "true" ]]; then
             RELEASE_FLAGS=(--prerelease)
           fi
           gh release create "v${VERSION}" Release/boringNotch.dmg \
+            --repo "${{ github.repository }}" \
+            --target "$TARGET_SHA" \
             --title "v${VERSION} - ${TITLE}" \
             --notes "$NOTES" \
             "${RELEASE_FLAGS[@]}"
 
   upgrade-brew:
     name: Update Homebrew cask
-    needs: [preparation, publish]
+    needs: [preparation, create_release]
     runs-on: ubuntu-latest
+    permissions: {}
     env:
       VERSION: ${{ needs.preparation.outputs.version }}
       IS_BETA: ${{ needs.preparation.outputs.is_beta }}
@@ -457,13 +919,37 @@ jobs:
           name: homebrew-cask-${{ env.VERSION }}
           path: boring-notch*.rb
 
+      - name: Resolve immutable Homebrew tap head
+        id: tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPO: TheBoredTeam/homebrew-boring-notch
+        run: |
+          set -euo pipefail
+          TAP_BRANCH=$(gh api "repos/${TAP_REPO}" --jq '.default_branch')
+          TAP_BRANCH_ENCODED=$(jq -rn --arg value "$TAP_BRANCH" '$value | @uri')
+          TAP_SHA=$(gh api "repos/${TAP_REPO}/commits/${TAP_BRANCH_ENCODED}" --jq '.sha')
+          if [[ ! "$TAP_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Homebrew tap head did not resolve to a full commit SHA"
+            exit 1
+          fi
+          {
+            echo "branch=$TAP_BRANCH"
+            echo "sha=$TAP_SHA"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: TheBoredTeam/homebrew-boring-notch
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          ref: ${{ steps.tap.outputs.sha }}
           path: homebrew-tap
+          # This is the sole credential-persisting checkout; the next step pushes this tap.
+          persist-credentials: true
 
       - name: Update casks in tap
+        env:
+          TAP_BRANCH: ${{ steps.tap.outputs.branch }}
         run: |
           set -euo pipefail
           cp boring-notch@rc.rb homebrew-tap/Casks/boring-notch@rc.rb
@@ -480,27 +966,37 @@ jobs:
             echo "No changes to commit"
           else
             git commit -m "$COMMIT_MSG"
-            git push
+            git push origin "HEAD:${TAP_BRANCH}"
           fi
 
   ending:
     name: Finalize
     if: ${{ always() && needs.preparation.result != 'skipped' && needs.check_release.outputs.is_release == 'true' }}
-    needs: [check_release, preparation, build, publish, upgrade-brew]
+    needs:
+      - check_release
+      - preparation
+      - verify_build_source
+      - build
+      - verify_publish_source
+      - publish
+      - update_release_metadata
+      - merge_stable_pr
+      - create_release
+      - upgrade-brew
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      issues: write
     env:
-      ALL_RESULTS: ${{ join(needs.*.result, ',') }}
       RELEASE_SUCCEEDED: ${{ !contains(join(needs.*.result, ','), 'failure') && !contains(join(needs.*.result, ','), 'cancelled') }}
     steps:
       - name: React to trigger comment
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           REPO="${{ github.repository }}"
           COMMENT_ID="${{ github.event.comment.id }}"
-          if [[ "$ALL_RESULTS" != *"failure"* && "$ALL_RESULTS" != *"cancelled"* ]]; then
+          if [[ "$RELEASE_SUCCEEDED" == "true" ]]; then
             REACTION="rocket"
           else
             REACTION="confused"
@@ -508,31 +1004,8 @@ jobs:
           gh api "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
             -f content="$REACTION" --silent
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        if: needs.preparation.outputs.is_beta == 'false' && env.RELEASE_SUCCEEDED == 'true'
-        with:
-          ref: ${{ needs.preparation.outputs.head_ref }}
-          fetch-depth: 0
-
-      - name: Merge PR (stable releases only)
-        if: needs.preparation.outputs.is_beta == 'false' && env.RELEASE_SUCCEEDED == 'true'
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          HEAD_REF: ${{ needs.preparation.outputs.head_ref }}
-          BASE_REF: ${{ needs.preparation.outputs.base_ref }}
-          VERSION: ${{ needs.preparation.outputs.version }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global credential.https://github.com.helper \
-            "!f() { echo \"username=x-access-token\"; printf \"password=%s\\n\" \"\${GITHUB_TOKEN}\"; }; f"
-          git fetch origin "$BASE_REF"
-          git checkout "$BASE_REF"
-          git merge --no-ff "origin/$HEAD_REF" -m "Release version v${VERSION}"
-          git push origin "$BASE_REF"
-
       - name: Summary
+        if: always()
         env:
           IS_BETA: ${{ needs.preparation.outputs.is_beta }}
           VERSION: ${{ needs.preparation.outputs.version }}
@@ -545,7 +1018,7 @@ jobs:
             BUILD_TYPE="stable"
           fi
           {
-            if [[ "${RELEASE_SUCCEEDED}" == "true" ]]; then
+            if [[ "$RELEASE_SUCCEEDED" == "true" ]]; then
               echo "✅ Released boringNotch v${VERSION} (${BUILD_TYPE} build ${BUILD_NUMBER})"
               echo "🍺 Homebrew cask updated"
               echo "📱 Sparkle appcast updated"
