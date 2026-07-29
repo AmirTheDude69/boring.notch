@@ -11,8 +11,6 @@ VOLUME_NAME="${3:?Volume name required}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SETTINGS="$SCRIPT_DIR/dmgbuild_settings.py"
 
-BACKGROUND_DIR="$SCRIPT_DIR/.background"
-
 die() {
   echo "Error: $*" >&2
   exit 1
@@ -35,61 +33,15 @@ ensure_dmgbuild_and_badge_support() {
   die "dmgbuild is not installed. Install hash-pinned dependencies first: python3 -m pip install --require-hashes -r $req_file"
 }
 
-find_app_icns() {
-  local app="$1"
-  local info_plist="$app/Contents/Info.plist"
-
-  if [ ! -f "$info_plist" ]; then
-    return 1
-  fi
-
-  local icon_file=""
-  icon_file="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$info_plist" 2>/dev/null || true)"
-  if [ -z "$icon_file" ]; then
-    icon_file="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$info_plist" 2>/dev/null || true)"
-  fi
-
-  if [ -n "$icon_file" ]; then
-    if [[ "$icon_file" != *.icns ]]; then
-      icon_file="$icon_file.icns"
-    fi
-    if [ -f "$app/Contents/Resources/$icon_file" ]; then
-      echo "$app/Contents/Resources/$icon_file"
-      return 0
-    fi
-  fi
-
-  # Fallback: any .icns inside the app bundle
-  local candidate
-  candidate="$(find "$app/Contents/Resources" -maxdepth 1 -name '*.icns' -print -quit 2>/dev/null || true)"
-  if [ -n "$candidate" ] && [ -f "$candidate" ]; then
-    echo "$candidate"
-    return 0
-  fi
-
-  return 1
-}
-
 if [ ! -f "$SETTINGS" ]; then
   die "dmgbuild settings not found: $SETTINGS"
 fi
 
 ensure_dmgbuild_and_badge_support
 
-export DMG_APP_PATH="$(abs_path "$APP_PATH")"
+DMG_APP_PATH="$(abs_path "$APP_PATH")"
+export DMG_APP_PATH
 export DMG_VOLUME_NAME="$VOLUME_NAME"
-
-BACKGROUND_TIFF="$BACKGROUND_DIR/background.tiff"
-
-export DMG_BACKGROUND="$(abs_path "$BACKGROUND_TIFF")"
-
-# Badge icon: use the app's icon for badging the volume icon
-if DMG_ICON_ICNS="$(find_app_icns "$DMG_APP_PATH" 2>/dev/null)"; then
-  export DMG_BADGE_ICON="$(abs_path "$DMG_ICON_ICNS")"
-  echo "Using badge icon for DMG volume."
-else
-  echo "No app icon found, skipping badge."
-fi
 
 echo "Creating DMG via dmgbuild: app=$DMG_APP_PATH output=$DMG_OUTPUT volume=$DMG_VOLUME_NAME"
 

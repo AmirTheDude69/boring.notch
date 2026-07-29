@@ -2,56 +2,103 @@
 """
 Remove the last beta item from an appcast XML file.
 Usage: remove_beta.py path/to/appcast.xml
-
-This script mirrors the inline Python used previously in the workflow.
 """
+
+from __future__ import annotations
+
+import os
+import stat
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
-def remove_last_beta_item(appcast_path: Path) -> int:
-    if not appcast_path.exists():
-        print(f"Appcast file not found: {appcast_path}")
-        return 1
+SPARKLE_NAMESPACE = "http://www.andymatuschak.org/xml-namespaces/sparkle"
 
+
+def _is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def resolve_workspace_file(
+    raw_path: str | Path,
+    workspace_root: str | Path | None = None,
+) -> Path:
+    value = str(raw_path)
+    if not value or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("Appcast path contains invalid characters")
+
+    root = Path(
+        workspace_root
+        or os.environ.get("GITHUB_WORKSPACE")
+        or Path.cwd()
+    ).resolve(strict=True)
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve(strict=True)
+    if not _is_within(resolved, root):
+        raise ValueError("Appcast path is outside the trusted workspace")
+    return resolved
+
+
+def remove_last_beta_item(
+    appcast_path: str | Path,
+    workspace_root: str | Path | None = None,
+) -> int:
     try:
-        tree = ET.parse(appcast_path)
-        root = tree.getroot()
+        trusted_path = resolve_workspace_file(appcast_path, workspace_root)
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(trusted_path, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError("Appcast path is not a regular file")
 
-        channel = root.find('channel')
-        if channel is None:
-            print('No channel found in appcast')
-            return 0
+            with os.fdopen(descriptor, "r+b", closefd=False) as appcast:
+                tree = ET.parse(appcast)
+                root = tree.getroot()
 
-        items = channel.findall('item')
-        removed = False
-        for item in reversed(items):
-            enclosure = item.find('enclosure')
-            if enclosure is not None:
-                version = enclosure.get('sparkle:version', '')
-                if 'beta' in version.lower():
-                    channel.remove(item)
-                    removed = True
-                    break
+                channel = root.find("channel")
+                if channel is None:
+                    print("No channel found in appcast")
+                    return 0
 
-        if removed:
-            tree.write(appcast_path, encoding='utf-8', xml_declaration=True)
-            print('Removed beta item from appcast')
-        else:
-            print('No beta item found in appcast')
+                removed = False
+                for item in reversed(channel.findall("item")):
+                    enclosure = item.find("enclosure")
+                    if enclosure is None:
+                        continue
+                    version = (
+                        enclosure.get(f"{{{SPARKLE_NAMESPACE}}}version")
+                        or enclosure.get("sparkle:version")
+                        or ""
+                    )
+                    if "beta" in version.lower():
+                        channel.remove(item)
+                        removed = True
+                        break
 
-        return 0
+                if not removed:
+                    print("No beta item found in appcast")
+                    return 0
 
-    except Exception as e:
-        print(f'Error processing appcast: {e}')
+                appcast.seek(0)
+                tree.write(appcast, encoding="utf-8", xml_declaration=True)
+                appcast.truncate()
+                appcast.flush()
+                os.fsync(appcast.fileno())
+                print("Removed beta item from appcast")
+                return 0
+        finally:
+            os.close(descriptor)
+    except (OSError, ET.ParseError, ValueError) as error:
+        print(f"Error processing appcast: {type(error).__name__}")
         return 2
 
 
-if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print('Usage: remove_beta.py path/to/appcast.xml')
-        sys.exit(1)
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: remove_beta.py path/to/appcast.xml")
+        raise SystemExit(1)
 
-    path = Path(sys.argv[1])
-    sys.exit(remove_last_beta_item(path))
+    raise SystemExit(remove_last_beta_item(sys.argv[1]))
