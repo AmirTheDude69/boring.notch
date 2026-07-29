@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import re
-import stat
 import sys
 from argparse import ArgumentParser
-from pathlib import Path
 
 
 MAX_COMMENT_LENGTH = 100_000
@@ -81,41 +78,6 @@ def find_first_valid(text: str) -> tuple[str | None, bool]:
     return None, False
 
 
-def _is_within(path: Path, root: Path) -> bool:
-    return path == root or root in path.parents
-
-
-def write_github_output(version: str | None, is_beta_flag: bool) -> None:
-    raw_output_path = os.environ.get("GITHUB_OUTPUT")
-    if not raw_output_path:
-        return
-
-    runner_temp = os.environ.get("RUNNER_TEMP")
-    if not runner_temp:
-        raise RuntimeError("RUNNER_TEMP is required when GITHUB_OUTPUT is set")
-
-    output_path = Path(raw_output_path)
-    if not output_path.is_absolute():
-        raise RuntimeError("GITHUB_OUTPUT must be an absolute runner-managed path")
-
-    trusted_root = Path(runner_temp).resolve(strict=True)
-    resolved_output = output_path.resolve(strict=True)
-    if not _is_within(resolved_output, trusted_root):
-        raise RuntimeError("GITHUB_OUTPUT is outside RUNNER_TEMP")
-
-    flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(output_path, flags)
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise RuntimeError("GITHUB_OUTPUT is not a regular file")
-        with os.fdopen(descriptor, "a", encoding="utf-8", closefd=False) as output:
-            output.write(f"version={version or ''}\n")
-            output.write(f"is_beta={str(is_beta_flag).lower()}\n")
-            output.flush()
-    finally:
-        os.close(descriptor)
-
-
 def main(argv=None) -> int:
     parser = ArgumentParser()
     parser.add_argument(
@@ -130,7 +92,6 @@ def main(argv=None) -> int:
         comment = sys.stdin.read(MAX_COMMENT_LENGTH + 1) or ""
 
     version, is_beta = find_first_valid(comment)
-    write_github_output(version, is_beta)
 
     print(f"version={version or ''}")
     print(f"is_beta={str(is_beta).lower()}")

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -46,47 +45,11 @@ class ExtractVersionTests(unittest.TestCase):
         malicious = "1." + ("a." * 200_000)
         self.assertEqual(extract_version.find_first_valid(malicious), (None, False))
 
-    def test_github_output_must_be_runner_managed(self):
-        with tempfile.TemporaryDirectory() as runner_temp:
-            trusted_output = Path(runner_temp) / "github-output"
-            trusted_output.touch()
-            previous_output = os.environ.get("GITHUB_OUTPUT")
-            previous_temp = os.environ.get("RUNNER_TEMP")
-            try:
-                os.environ["GITHUB_OUTPUT"] = str(trusted_output)
-                os.environ["RUNNER_TEMP"] = runner_temp
-                extract_version.write_github_output("1.2.3", False)
-                self.assertEqual(
-                    trusted_output.read_text(encoding="utf-8"),
-                    "version=1.2.3\nis_beta=false\n",
-                )
-
-                outside = Path(runner_temp).parent / "outside-output"
-                outside.touch()
-                self.addCleanup(outside.unlink, missing_ok=True)
-                os.environ["GITHUB_OUTPUT"] = str(outside)
-                with self.assertRaises(RuntimeError):
-                    extract_version.write_github_output("1.2.3", False)
-            finally:
-                if previous_output is None:
-                    os.environ.pop("GITHUB_OUTPUT", None)
-                else:
-                    os.environ["GITHUB_OUTPUT"] = previous_output
-                if previous_temp is None:
-                    os.environ.pop("RUNNER_TEMP", None)
-                else:
-                    os.environ["RUNNER_TEMP"] = previous_temp
-
-
 class RemoveBetaTests(unittest.TestCase):
-    def test_rejects_paths_outside_workspace(self):
-        with tempfile.TemporaryDirectory() as workspace, tempfile.NamedTemporaryFile() as outside:
-            self.assertEqual(
-                remove_beta.remove_last_beta_item(outside.name, workspace),
-                2,
-            )
+    def test_rejects_paths_other_than_the_fixed_workspace_appcast(self):
+        self.assertEqual(remove_beta.remove_last_beta_item("/tmp/outside.xml"), 2)
 
-    def test_updates_only_a_workspace_appcast(self):
+    def test_updates_an_already_opened_appcast(self):
         with tempfile.TemporaryDirectory() as workspace:
             appcast = Path(workspace) / "appcast.xml"
             appcast.write_text(
@@ -100,10 +63,8 @@ class RemoveBetaTests(unittest.TestCase):
 """,
                 encoding="utf-8",
             )
-            self.assertEqual(
-                remove_beta.remove_last_beta_item(appcast, workspace),
-                0,
-            )
+            with appcast.open("r+b") as stream:
+                self.assertEqual(remove_beta._remove_last_beta_from_stream(stream), 0)
             self.assertNotIn("beta", appcast.read_text(encoding="utf-8"))
 
 
