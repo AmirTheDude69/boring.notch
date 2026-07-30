@@ -2,70 +2,100 @@
 
 from __future__ import annotations
 
-import json
-import os
 import re
-import subprocess
 import sys
 from argparse import ArgumentParser
 
 
-SEMVER_RE = re.compile(r"v?[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?")
-NUMERIC_IDENTIFIER = r"(?:0|[1-9][0-9]*)"
-ALPHANUMERIC_IDENTIFIER = r"(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
-PRERELEASE_IDENTIFIER = rf"(?:{NUMERIC_IDENTIFIER}|{ALPHANUMERIC_IDENTIFIER})"
-BUILD_IDENTIFIER = r"(?:[0-9A-Za-z-]+)"
-NORMALIZED_SEMVER_RE = re.compile(
-    rf"^({NUMERIC_IDENTIFIER})\.({NUMERIC_IDENTIFIER})\.({NUMERIC_IDENTIFIER})"
-    rf"(?:-({PRERELEASE_IDENTIFIER}(?:\.{PRERELEASE_IDENTIFIER})*))?"
-    rf"(?:\+({BUILD_IDENTIFIER}(?:\.{BUILD_IDENTIFIER})*))?$"
+MAX_COMMENT_LENGTH = 100_000
+MAX_VERSION_LENGTH = 255
+MAX_NUMERIC_IDENTIFIER_LENGTH = 10
+MAX_IDENTIFIER_LENGTH = 64
+VERSION_CANDIDATE_RE = re.compile(
+    rf"(?<![0-9A-Za-z.+-])v?[0-9][0-9A-Za-z.+-]{{2,{MAX_VERSION_LENGTH - 1}}}"
+    rf"(?![0-9A-Za-z+-])"
 )
+IDENTIFIER_RE = re.compile(rf"^[0-9A-Za-z-]{{1,{MAX_IDENTIFIER_LENGTH}}}$")
 
 
-def find_first_valid(text: str):
-    for cand in SEMVER_RE.findall(text or ""):
-        s = cand.lstrip("v")
-        # Normalize for parsing: 2.7 -> 2.7.0, 2.7-beta -> 2.7.0-beta
-        # Regex: look for X.Y at start, not followed by .Z
-        normalized = re.sub(r"^([0-9]+\.[0-9]+)(?![0-9]*\.)", r"\1.0", s)
-        parsed = NORMALIZED_SEMVER_RE.fullmatch(normalized)
+def _valid_identifier_list(value: str, *, numeric_leading_zero_forbidden: bool) -> bool:
+    identifiers = value.split(".")
+    if not identifiers or len(identifiers) > 16:
+        return False
+    for identifier in identifiers:
+        if not IDENTIFIER_RE.fullmatch(identifier):
+            return False
+        if (
+            numeric_leading_zero_forbidden
+            and identifier.isdigit()
+            and len(identifier) > 1
+            and identifier.startswith("0")
+        ):
+            return False
+    return True
+
+
+def parse_semver(candidate: str) -> tuple[str, bool] | None:
+    value = candidate[1:] if candidate.startswith("v") else candidate
+    if not value or len(value) > MAX_VERSION_LENGTH or value.count("+") > 1:
+        return None
+
+    version_and_prerelease, plus, build = value.partition("+")
+    if plus and not _valid_identifier_list(
+        build,
+        numeric_leading_zero_forbidden=False,
+    ):
+        return None
+
+    core, dash, prerelease = version_and_prerelease.partition("-")
+    if dash and not _valid_identifier_list(
+        prerelease,
+        numeric_leading_zero_forbidden=True,
+    ):
+        return None
+
+    core_parts = core.split(".")
+    if len(core_parts) not in (2, 3):
+        return None
+    for part in core_parts:
+        if (
+            not part.isdigit()
+            or len(part) > MAX_NUMERIC_IDENTIFIER_LENGTH
+            or (len(part) > 1 and part.startswith("0"))
+        ):
+            return None
+
+    return value, bool(dash)
+
+
+def find_first_valid(text: str) -> tuple[str | None, bool]:
+    bounded_text = (text or "")[:MAX_COMMENT_LENGTH]
+    for match in VERSION_CANDIDATE_RE.finditer(bounded_text):
+        candidate = match.group(0).rstrip(".,;:!?)]}")
+        parsed = parse_semver(candidate)
         if parsed:
-            return s, parsed
-    return None, None
-
-
-def write_github_output(version: str | None, is_beta_flag: bool) -> None:
-    out = os.environ.get("GITHUB_OUTPUT")
-    if not out:
-        return
-    try:
-        with open(out, "a", encoding="utf-8") as f:
-            f.write(f"version={version or ''}\n")
-            f.write(f"is_beta={str(is_beta_flag).lower()}\n")
-    except Exception:
-        pass
+            return parsed
+    return None, False
 
 
 def main(argv=None) -> int:
-    p = ArgumentParser()
-    p.add_argument("-c", "--comment", help="Comment body to scan (defaults: $COMMENT or stdin)")
-    args = p.parse_args(argv)
+    parser = ArgumentParser()
+    parser.add_argument(
+        "-c",
+        "--comment",
+        help="Comment body to scan (defaults: $COMMENT or stdin)",
+    )
+    args = parser.parse_args(argv)
 
     comment = args.comment or os.environ.get("COMMENT")
     if not comment:
-        comment = sys.stdin.read() or ""
+        comment = sys.stdin.read(MAX_COMMENT_LENGTH + 1) or ""
 
-    version, parsed = find_first_valid(comment)
+    version, is_beta = find_first_valid(comment)
 
-    beta = bool(parsed and parsed.group(4))
-
-    # Write GitHub Actions outputs if available (GITHUB_OUTPUT)
-    write_github_output(version, bool(beta))
-
-    # For CLI consumption print simple key=value lines (and a human line)
     print(f"version={version or ''}")
-    print(f"is_beta={str(bool(beta)).lower()}")
-    print(f"Found version: {version} (beta: {bool(beta)})")
+    print(f"is_beta={str(is_beta).lower()}")
+    print(f"Found version: {version} (beta: {is_beta})")
     return 0
 
 

@@ -2,7 +2,7 @@ name: "Reusable Build"
 on:
   workflow_call:
     inputs:
-      head_ref:
+      head_sha:
         required: true
         type: string
       version:
@@ -31,7 +31,7 @@ jobs:
   build:
     runs-on: macos-latest
     permissions:
-      contents: write
+      contents: read
     env:
       PROJECT_NAME: boringNotch
       EXPORT_METHOD: development
@@ -41,9 +41,19 @@ jobs:
       CODE_SIGN_IDENTITY: ${{ inputs.code_sign_identity }}
       XCODE_VERSION: ${{ inputs.xcode_version }}
     steps:
+      - name: Validate immutable source commit
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::head_sha must be a full immutable commit SHA"
+            exit 1
+          fi
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.head_ref }}
+          ref: ${{ inputs.head_sha }}
+          persist-credentials: false
 
       - name: Resolve Swift packages
         run: xcodebuild -resolvePackageDependencies -project ${{ env.PROJECT_NAME }}.xcodeproj
@@ -77,38 +87,26 @@ jobs:
 
       - name: Set version and build number
         run: |
-          PBXPROJ="${{ env.PROJECT_NAME }}.xcodeproj/project.pbxproj"
-          VERSION="${{ env.VERSION_INPUT }}"
-          BUILD_NUMBER_INPUT="${{ env.BUILD_NUMBER_INPUT }}"
-          if [[ -z "$BUILD_NUMBER_INPUT" ]]; then
+          PBXPROJ="${PROJECT_NAME}.xcodeproj/project.pbxproj"
+          VERSION="$VERSION_INPUT"
+          REQUESTED_BUILD_NUMBER="$BUILD_NUMBER_INPUT"
+          if [[ -z "$REQUESTED_BUILD_NUMBER" ]]; then
             BUILD_NUMBER="$GITHUB_RUN_NUMBER"
           else
-            BUILD_NUMBER="$BUILD_NUMBER_INPUT"
+            BUILD_NUMBER="$REQUESTED_BUILD_NUMBER"
           fi
           if [[ -n "$VERSION" ]]; then
             sed -i '' "s/MARKETING_VERSION = [^;]*/MARKETING_VERSION = ${VERSION}/g" "$PBXPROJ"
           fi
           sed -i '' "s/CURRENT_PROJECT_VERSION = [^;]*/CURRENT_PROJECT_VERSION = ${BUILD_NUMBER}/g" "$PBXPROJ"
 
-      - name: Commit version changes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${{ env.PROJECT_NAME }}.xcodeproj/project.pbxproj"
-          VERSION="${{ env.VERSION_INPUT }}"
-          BUILD_NUMBER_INPUT="${{ env.BUILD_NUMBER_INPUT }}"
-          if [[ -z "$BUILD_NUMBER_INPUT" ]]; then
-            BUILD_NUMBER="$GITHUB_RUN_NUMBER"
-          else
-            BUILD_NUMBER="$BUILD_NUMBER_INPUT"
-          fi
-          if [[ -n "$VERSION" ]]; then
-            COMMIT_MSG="Set version to v${VERSION} (build ${BUILD_NUMBER})"
-          else
-            COMMIT_MSG="Set build number to ${BUILD_NUMBER}"
-          fi
-          git commit -m "$COMMIT_MSG" || true
-          git push origin "HEAD:${{ inputs.head_ref }}" || true
+      - name: Upload release project metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-project-metadata
+          path: ${{ env.PROJECT_NAME }}.xcodeproj/project.pbxproj
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Build and archive
         run: |
@@ -158,9 +156,9 @@ jobs:
           python3 -m pip install --require-hashes -r Configuration/dmg/requirements.txt
           chmod +x Configuration/dmg/create_dmg.sh
           ./Configuration/dmg/create_dmg.sh \
-            "Release/${{ env.PROJECT_NAME }}.app" \
-            "Release/${{ env.PROJECT_NAME }}.dmg" \
-            "${{ env.PROJECT_NAME }} ${{ env.VERSION_INPUT }}"
+            "Release/${PROJECT_NAME}.app" \
+            "Release/${PROJECT_NAME}.dmg" \
+            "${PROJECT_NAME} ${VERSION_INPUT}"
 
       - name: Upload DMG
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
